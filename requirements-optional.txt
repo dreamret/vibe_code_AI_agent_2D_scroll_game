@@ -1,0 +1,8 @@
+# Optional extras - start.bat tries each one; failures are ignored.
+# Gamepad recording (and virtual-pad replay needs vgamepad + ViGEmBus driver)
+pygame
+vgamepad
+# OCR for CAPTCHA keywords / HUD text (also needs the Tesseract program installed)
+pytesseract
+# Custom YOLO detector packs (large download, installs PyTorch) - uncomment if needed:
+# ultralytics

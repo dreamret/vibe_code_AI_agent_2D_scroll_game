@@ -1,0 +1,8 @@
+# Core (installed automatically by start.bat)
+PySide6>=6.6
+numpy>=1.24
+opencv-python>=4.8
+mss>=9.0
+pynput>=1.7.6
+tinydb>=4.8
+pymongo>=4.6

@@ -1,0 +1,8 @@
+{"timestamp": "2026-11-05T04:31:02.745", "level": "INFO", "component": "database", "event_id": "DB_READY", "message": "Database ready (tinydb)", "context": {}}
+{"timestamp": "2026-11-05T04:31:02.745", "level": "INFO", "component": "database", "event_id": "LOG_PURGE", "message": "Purged 0 log records older than 30 days", "context": {}}
+{"timestamp": "2026-11-05T04:31:02.745", "level": "INFO", "component": "profiles", "event_id": "PROFILE_CREATE", "message": "Created profile 'Default 2D Side-Scroller'", "context": {}}
+{"timestamp": "2026-11-05T04:31:02.751", "level": "INFO", "component": "router", "event_id": "HOTKEY_READY", "message": "Emergency hotkey active: F12", "context": {}}
+{"timestamp": "2026-11-05T04:31:02.751", "level": "INFO", "component": "app", "event_id": "APP_READY", "message": "Application ready", "context": {"database": "tinydb", "windows_platform": true}}
+{"timestamp": "2026-11-05T04:31:03.227", "level": "INFO", "component": "app", "event_id": "TARGET_SELECTED", "message": "Target selected: primary monitor", "context": {"process": null}}
+{"timestamp": "2026-11-05T04:31:28.527", "level": "INFO", "component": "app", "event_id": "APP_SHUTDOWN", "message": "Shutting down", "context": {}}
+{"timestamp": "2026-11-05T04:31:28.527", "level": "INFO", "component": "router", "event_id": "ROUTER_DISABLE", "message": "Input execution disabled by user", "context": {}}
