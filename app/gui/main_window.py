@@ -330,6 +330,7 @@ class MainWindow(QMainWindow):
         ("recordings_dir", "str", "Recording folder", None),
         ("ocr_enabled", "bool", "Enable OCR (needs Tesseract)", None),
         ("tesseract_cmd", "str", "Tesseract executable (optional)", None),
+        ("ocr_languages", "str", "OCR languages (eng+chi_tra+jpn = EN + zh-TW + ja-JP)", None),
         ("emergency_hotkey", "str", "Emergency stop hotkey (restart to apply)", None),
         ("max_actions_per_second", "int", "Max actions / second", (1, 60)),
         ("min_confidence", "float", "Min. confidence for proposals", (0.0, 1.0)),
@@ -852,7 +853,8 @@ class MainWindow(QMainWindow):
             + ("\nNearest enemy: dx={:.2f} dy={:.2f}".format(sc["nearest_enemy"]["dx"],
                                                              sc["nearest_enemy"]["dy"])
                if sc.get("nearest_enemy") else "")
-            + ("\nOCR: " + " | ".join(sc["ocr_text"][:5]) if sc["ocr_text"] else ""))
+            + (f"\nText language: {sc.get('text_language', 'unknown')}\nOCR: "
+               + " | ".join(sc["ocr_text"][:5]) if sc["ocr_text"] else ""))
         ents = res.entities[:60]
         self.tbl_entities.setRowCount(len(ents))
         for r, e in enumerate(ents):

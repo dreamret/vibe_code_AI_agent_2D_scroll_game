@@ -24,6 +24,15 @@ Run `pip freeze > requirements.lock.txt` once it works to pin exact versions
    *Replay a recorded session* or *Assist mode* (every proposed action needs your click).
 6. **Emergency stop: F12** (global hotkey, configurable) or the red **STOP** button.
 
+## Languages (English, 繁體中文 zh-TW, 日本語 ja-JP)
+OCR reads game text in all three. Install **Tesseract** (e.g. the UB-Mannheim Windows build) and tick the
+*Traditional Chinese* (`chi_tra`) and *Japanese* (`jpn`) language data, then enable OCR in Settings
+(`ocr_languages` = `eng+chi_tra+jpn`). The app warns in the log if a language pack is missing.
+Recognised text is used for CAPTCHA keywords (EN/zh-TW/ja-JP built in, more via profile
+`detector.captcha_keywords`), class signatures (e.g. `"劍士": ["劍士","斬擊"]`) and a script-based
+text-language indicator in the Scene tab. Note: Traditional vs Simplified Chinese is reported as `zh`.
+The window/menu text of the app itself is still English.
+
 ## Safety behaviour (from the proposal)
 * No input is sent unless the human switch is ON, the game window is focused, the control is allowed
   by the profile and the rate limit is respected.

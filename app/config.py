@@ -30,6 +30,7 @@ DEFAULTS = {
     "ocr_enabled": False,
     "ocr_interval_sec": 1.0,
     "tesseract_cmd": "",
+    "ocr_languages": "eng+chi_tra+jpn",  # Tesseract codes: English, zh-TW, ja-JP
     # --- automation safety ---------------------------------------------
     "emergency_hotkey": "f12",
     "max_actions_per_second": 10,

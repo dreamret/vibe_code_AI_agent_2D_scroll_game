@@ -1,6 +1,7 @@
 """Perception service: detection, tracking, OCR, CAPTCHA/marker + class inference."""
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -14,7 +15,48 @@ BUILTIN_CAPTCHA_KEYWORDS = [
     "verify you are human", "verify you're human", "are you human",
     "security check", "select all images", "slide to verify", "drag the slider",
     "anti-bot", "human verification",
+    # zh-TW
+    "驗證碼", "人機驗證", "我不是機器人", "請驗證", "安全驗證", "安全性驗證",
+    "拖曳滑桿", "滑動驗證", "選取所有圖片", "請證明您是真人",
+    # ja-JP
+    "キャプチャ", "ロボットではありません", "人間であることを確認", "認証",
+    "画像をすべて選択", "スライダーをドラッグ", "セキュリティチェック",
 ]
+
+_CJK = r"\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f"
+_CJK_GAP = re.compile(rf"(?<=[{_CJK}])\s+(?=[{_CJK}])")
+_HAS_CJK = re.compile(rf"[{_CJK}]")
+_KANA = re.compile(r"[\u3040-\u30ff]")
+_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def normalize_text(s: str) -> str:
+    """Tesseract puts spaces between CJK characters; remove them."""
+    return _CJK_GAP.sub("", s).strip()
+
+
+def squash(s: str) -> str:
+    """Lower-case and drop all whitespace - for keyword matching across languages."""
+    return re.sub(r"\s+", "", s.lower())
+
+
+def detect_text_language(lines: list[str]) -> dict:
+    """Script-based language guess for recognised text: ja-JP (kana present),
+    zh (Han only) and en. Traditional vs Simplified Chinese is not distinguished
+    reliably by script counting, so Han-only text is reported as 'zh'."""
+    blob = " ".join(lines)
+    kana, han, latin = len(_KANA.findall(blob)), len(_HAN.findall(blob)), len(_LATIN.findall(blob))
+    total = kana + han + latin
+    if total == 0:
+        return {"language": "unknown", "counts": {"kana": 0, "han": 0, "latin": 0}}
+    if kana >= 2:
+        lang = "ja-JP"
+    elif han >= max(2, latin):
+        lang = "zh"
+    else:
+        lang = "en"
+    return {"language": lang, "counts": {"kana": kana, "han": han, "latin": latin}}
 
 
 @dataclass
@@ -149,21 +191,42 @@ class YoloDetector:
 
 
 class OcrEngine:
-    def __init__(self, tesseract_cmd: str, log):
+    """Tesseract OCR, multilingual (default English + Traditional Chinese + Japanese).
+    Needs the Tesseract program with the `chi_tra` and `jpn` language data installed."""
+
+    def __init__(self, tesseract_cmd: str, languages: str, log):
         import pytesseract
         if tesseract_cmd:
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
         self.pt = pytesseract
         self.log = log
         self.pt.get_tesseract_version()       # raises if the executable is missing
+        wanted = [l for l in (languages or "eng").split("+") if l]
+        have = set(self.pt.get_languages(config=""))
+        usable = [l for l in wanted if l in have]
+        missing = [l for l in wanted if l not in have]
+        if missing:
+            log.warning("perception",
+                        f"Tesseract language data missing: {', '.join(missing)}. Re-run the "
+                        "Tesseract installer and tick them (zh-TW = chi_tra, ja-JP = jpn).",
+                        event_id="OCR_LANG_MISSING", available=sorted(have))
+        if not usable:
+            usable = ["eng"] if "eng" in have else sorted(have)[:1]
+        self.lang = "+".join(usable)
+        log.info("perception", f"OCR languages: {self.lang}", event_id="OCR_READY")
 
     def read(self, frame: np.ndarray) -> list[str]:
         g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if g.shape[1] > 1280:
-            f = 1280 / g.shape[1]
+        if g.shape[1] > 1920:
+            f = 1920 / g.shape[1]
             g = cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
-        text = self.pt.image_to_string(g)
-        return [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 3][:60]
+        text = self.pt.image_to_string(g, lang=self.lang, config="--psm 11")
+        out = []
+        for ln in text.splitlines():
+            ln = normalize_text(ln)
+            if len(ln) >= (2 if _HAS_CJK.search(ln) else 3):   # 2 CJK characters are a word
+                out.append(ln)
+        return out[:60]
 
 
 # --------------------------------------------------------------------------
@@ -226,6 +289,7 @@ def extract_scene(entities: list[Entity], shape, ocr_text: list[str], labels: li
                 for l, v in pos.items()}
     return {"size": [w, h], "counts": counts, "mean_pos": mean_pos, "player": player,
             "nearest_enemy": nearest, "ocr_text": ocr_text[:15],
+            "text_language": detect_text_language(ocr_text)["language"],
             "labels_present": sorted(l for l, c in counts.items() if c),
             "scene_type": "gameplay" if (player or entities) else "unknown"}
 
@@ -233,9 +297,9 @@ def extract_scene(entities: list[Entity], shape, ocr_text: list[str], labels: li
 def detect_captcha(ocr_text: list[str], captcha_entities: list[Entity],
                    extra_keywords: list[str]) -> dict:
     """Detection ONLY. The application never solves or bypasses CAPTCHAs."""
-    kws = BUILTIN_CAPTCHA_KEYWORDS + [k.lower() for k in extra_keywords]
-    blob = " ".join(ocr_text).lower()
-    hits = [k for k in kws if k in blob]
+    kws = BUILTIN_CAPTCHA_KEYWORDS + list(extra_keywords)
+    blob = squash(" ".join(ocr_text))
+    hits = [k for k in kws if squash(k) and squash(k) in blob]
     if captcha_entities:
         best = max(captcha_entities, key=lambda e: e.confidence)
         return {"detected": True, "reason": f"CAPTCHA template '{best.name}' matched",
@@ -257,12 +321,12 @@ def infer_class(profile: dict, entities: list[Entity], ocr_text: list[str]) -> d
                     "evidence": ["profile class_hint (not verified visually)"]}
         return {"candidate": "Unknown", "confidence": 0.0, "evidence": []}
     seen = {e.name.lower() for e in entities} | {e.label.lower() for e in entities}
-    blob = " ".join(ocr_text).lower()
+    blob = squash(" ".join(ocr_text))
     scored = []
     for cls, kws in sigs.items():
         if not kws:
             continue
-        ev = [k for k in kws if k.lower() in seen or k.lower() in blob]
+        ev = [k for k in kws if k.lower() in seen or squash(k) in blob]
         scored.append((len(ev) / len(kws), cls, ev))
     scored.sort(reverse=True)
     if not scored or scored[0][0] < 0.5:
@@ -315,7 +379,8 @@ class PerceptionService:
         self.ocr = None
         if self.settings["ocr_enabled"] or d.get("use_ocr"):
             try:
-                self.ocr = OcrEngine(self.settings["tesseract_cmd"], self.log)
+                self.ocr = OcrEngine(self.settings["tesseract_cmd"],
+                                     self.settings["ocr_languages"], self.log)
             except Exception as exc:
                 self.log.warning("perception",
                                  f"OCR disabled ({exc.__class__.__name__}): install Tesseract "

@@ -11,8 +11,8 @@ import cv2
 
 from app.db import match, clean
 from app.learning import StateEncoder, edit_similarity, compare_examples
-from app.perception import (TemplateDetector, Tracker, detect_captcha, extract_scene,
-                            infer_class)
+from app.perception import (TemplateDetector, Tracker, detect_captcha, detect_text_language,
+                            extract_scene, infer_class, normalize_text)
 from app.profiles import validate, PROFILE_TEMPLATE
 
 
@@ -88,6 +88,26 @@ class TestPerception(unittest.TestCase):
     def test_unknown_class_when_no_evidence(self):
         prof = {"character": {"class_signatures": {"Mage": ["staff", "orb"]}}}
         self.assertEqual(infer_class(prof, [], [])["candidate"], "Unknown")
+
+
+class TestMultilingual(unittest.TestCase):
+    def test_normalize_cjk_spaces(self):
+        self.assertEqual(normalize_text("我 不 是 機 器 人"), "我不是機器人")
+        self.assertEqual(normalize_text("Level 5 勇 者"), "Level 5 勇者")
+
+    def test_captcha_zh_tw_and_ja(self):
+        self.assertTrue(detect_captcha(["請 完 成 人 機 驗 證"], [], [])["detected"])
+        self.assertTrue(detect_captcha(["私は ロボット ではありません"], [], [])["detected"])
+        self.assertFalse(detect_captcha(["背包", "裝備"], [], [])["detected"])
+
+    def test_language_detection(self):
+        self.assertEqual(detect_text_language(["勇者のスキル"])["language"], "ja-JP")
+        self.assertEqual(detect_text_language(["生命值 攻擊力"])["language"], "zh")
+        self.assertEqual(detect_text_language(["Attack Power"])["language"], "en")
+
+    def test_class_signature_cjk(self):
+        prof = {"character": {"class_signatures": {"劍士": ["劍士", "斬擊"]}}}
+        self.assertEqual(infer_class(prof, [], ["職業: 劍 士", "技能 斬擊"])["candidate"], "劍士")
 
 
 class TestLearning(unittest.TestCase):
