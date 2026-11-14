@@ -16,7 +16,7 @@ import cv2
 
 from . import autolabel, gpu, media, winutil
 from .imgio import imwrite
-from .action_router import ActionRouter
+from .action_router import ActionRouter, validate_control
 from .capture import CaptureService
 from .config import Settings
 from .db import Database, new_id, now_iso
@@ -94,6 +94,7 @@ class AppController:
         self.perception.configure(self.profile)
         self._load_policy()
         self.perception.start()
+        threading.Thread(target=self.migrate_labels, daemon=True, name="migrate").start()
         self.router.start_hotkey()
         self.log.info("app", "Application ready", event_id="APP_READY",
                       database=self.db.backend_name, windows_platform=winutil.IS_WINDOWS)
@@ -275,10 +276,10 @@ class AppController:
             "class_inference": res.class_info, "captcha": res.captcha,
             "detector_results": [e.to_dict() for e in res.entities]})
         if res.entities:
-            self.db.insert_many("entities", [
-                {"session_id": self.session["_id"], "frame_id": fid,
-                 "frame_index": res.frame_index, "timestamp": res.timestamp,
-                 "user_correction": False, **e.to_dict()} for e in res.entities])
+            self.save_labels([self.label_doc(
+                e.label, e.bbox, "detector", session_id=self.session["_id"], frame_id=fid,
+                frame_index=res.frame_index, timestamp=res.timestamp, confidence=e.confidence,
+                track_id=e.track_id, name=e.name, detector=e.source) for e in res.entities])
 
     # ---- human actions -> DB + training examples ----------------------
     def _scene_at(self, ts: float):
@@ -384,8 +385,8 @@ class AppController:
                         errs.append(abs(res["delivered_at"] - max(due, start)) * 1000)
                         break
                     reason = res["reason"]
-                    if reason == "target_window_not_focused":
-                        self.router.pause("focus_lost")           # human must refocus + resume
+                    if reason in ("target_window_not_focused", "target_window_missing"):
+                        self.router.pause("focus_lost" if reason.endswith("focused") else "window_lost")
                         continue
                     if reason == "rate_limit" and tries < 5:
                         tries += 1
@@ -585,11 +586,11 @@ class AppController:
         stamp = f"{int(time.time() * 1000)}"
         frame_path = cdir / f"frame_{stamp}.jpg"
         imwrite(frame_path, res.image, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        eid = self.db.insert("entities", {
-            "session_id": (self.session or {}).get("_id", ""), "frame_index": res.frame_index,
-            "timestamp": res.timestamp, "label": label, "bbox": [x, y, bw, bh],
-            "confidence": 1.0, "track_id": -1, "user_correction": True,
-            "frame_ref": str(frame_path), "review_status": "approved", "source": "user"})
+        label = safe_label(label)
+        self.ensure_element(label, "other")
+        eid = self.save_labels([self.label_doc(
+            label, (x, y, bw, bh), "correction", session_id=(self.session or {}).get("_id", ""),
+            frame_index=res.frame_index, timestamp=res.timestamp, frame_ref=str(frame_path))])[0]
         if add_template:
             label = safe_label(label)
             tdir = self.settings.path("templates_dir") / self.profile["_id"] / label
@@ -659,6 +660,40 @@ class AppController:
         self._load_policy()
         self.on_state()
 
+
+    # ---- ONE label table: every label instance lives in `entities` ------
+    # source = detector | correction | auto_label | media
+    def label_doc(self, label: str, bbox, source: str, **extra) -> dict:
+        doc = {"profile_id": self.profile["_id"], "label": label, "bbox": [int(v) for v in bbox],
+               "confidence": 1.0, "track_id": -1, "source": source,
+               "user_correction": source == "correction", "auto_label": source == "auto_label",
+               "review_status": "approved" if source in ("correction", "auto_label") else "auto",
+               "session_id": "", "media_id": "", "frame_index": -1, "timestamp": time.time()}
+        doc.update(extra)
+        return doc
+
+    def save_labels(self, docs: list[dict]) -> list[str]:
+        return self.db.insert_many("entities", docs)
+
+    def migrate_labels(self):
+        """Older entity rows: add `source` / `profile_id` so every label shares one schema."""
+        try:
+            sess = {x["_id"]: x.get("profile_id", "") for x in self.db.find("sessions")}
+            fixed = 0
+            for e in self.db.find("entities"):
+                ch = {}
+                if "source" not in e or e.get("source") in ("template", "yolo", "yolo-onnx"):
+                    ch["source"] = ("correction" if e.get("user_correction") else
+                                    "auto_label" if e.get("auto_label") else "detector")
+                if "profile_id" not in e:
+                    ch["profile_id"] = sess.get(e.get("session_id", ""), "")
+                if ch:
+                    self.db.update("entities", e["_id"], ch)
+                    fixed += 1
+            if fixed:
+                self.log.info("database", f"Label table normalised ({fixed} rows)", event_id="LABELS_MIGRATED")
+        except Exception as exc:
+            self.log.warning("database", f"Label migration skipped: {exc}", event_id="LABELS_MIGRATE_FAIL")
 
     # ---- elements (user-configurable label catalogue) -------------------
     ELEMENT_CATEGORIES = ["character", "enemy", "npc", "item", "skill_effect", "ui", "marker",
@@ -794,31 +829,120 @@ class AppController:
                 "used_mapped": sorted(n for n, c in mapping.items() if c in used),
                 "action_names": sorted(mapping)}
 
+    # ---- keybinds: the profile's input_mapping IS the keybind table -----
+    @staticmethod
+    def device_of(control: str) -> str:
+        return "mouse" if control.startswith("mouse_") else \
+            "gamepad" if control.startswith("gamepad_") else "keyboard"
+
+    def list_keybinds(self) -> list[dict]:
+        pid = self.profile["_id"]
+        meta = {k["control"]: k for k in self.db.find("keybinds", {"profile_id": pid})}
+        rows = [{"action": n, "control": c, "device": self.device_of(c),
+                 "purpose": meta.get(c, {}).get("purpose", ""), "status": "mapped"}
+                for n, c in self.profile["input_mapping"].items()]
+        for c in self.profile["constraints"].get("ignored_controls", []):
+            rows.append({"action": "", "control": c, "device": self.device_of(c),
+                         "purpose": meta.get(c, {}).get("purpose", ""), "status": "ignored"})
+        return rows
+
+    def set_keybind(self, action: str, control: str, purpose: str = "", old_action: str = "") -> str:
+        """Add/rename/rebind a game action. Raises ValueError for bad or duplicate input."""
+        control = validate_control(control)
+        name = re.sub(r"\W+", "_", action.strip().lower()).strip("_")
+        if not name:
+            raise ValueError("Action name is empty")
+        prof = self.profile
+        mapping = prof["input_mapping"]
+        for n, c in mapping.items():
+            if c == control and n not in (name, old_action):
+                raise ValueError(f"'{control}' is already used by '{n}'")
+        if name != old_action and name in mapping:
+            raise ValueError(f"Action '{name}' already exists")
+        if old_action and old_action in mapping:
+            mapping.pop(old_action)
+        mapping[name] = control
+        allowed = prof["constraints"].get("allowed_controls")
+        if allowed and control not in allowed:
+            allowed.append(control)
+        ig = prof["constraints"].get("ignored_controls", [])
+        if control in ig:
+            ig.remove(control)
+        self.profile = self.profiles.save(prof)
+        pid = self.profile["_id"]
+        ex = self.db.find("keybinds", {"profile_id": pid, "control": control})
+        doc = {"profile_id": pid, "control": control, "device": self.device_of(control),
+               "action_name": name, "purpose": purpose, "status": "mapped"}
+        if ex:
+            self.db.update("keybinds", ex[0]["_id"], doc)
+        else:
+            self.db.insert("keybinds", {**doc, "created": now_iso()})
+        self.log.info("keybinds", f"Keybind {name} = {control}", event_id="KEYBIND_SET")
+        self.on_state()
+        return name
+
+    def remove_keybind(self, action: str):
+        prof = self.profile
+        control = prof["input_mapping"].pop(action, None)
+        if control is None:
+            return
+        allowed = prof["constraints"].get("allowed_controls")
+        if allowed and control in allowed:
+            allowed.remove(control)
+        self.profile = self.profiles.save(prof)
+        self.db.delete("keybinds", {"profile_id": prof["_id"], "control": control})
+        self.log.info("keybinds", f"Keybind '{action}' removed", event_id="KEYBIND_REMOVED")
+        self.on_state()
+
+    def unignore_control(self, control: str):
+        ig = self.profile["constraints"].get("ignored_controls", [])
+        if control in ig:
+            ig.remove(control)
+            self.profile = self.profiles.save(self.profile)
+            self.db.delete("keybinds", {"profile_id": self.profile["_id"], "control": control,
+                                        "status": "ignored"})
+
+    def test_keybind(self, control: str):
+        """Send one press of `control` through the active input path (safety gates apply)."""
+        def run():
+            res = self.router.execute({"input_device": self.device_of(control), "control": control,
+                                       "duration": 0.15, "x": 40, "y": 40}, "test")
+            self.log.info("keybinds", f"Test of '{control}': "
+                          + ("sent" if res["ok"] else f"blocked ({res['reason']})"),
+                          event_id="KEYBIND_TEST", mode=self.router.mode)
+        threading.Thread(target=run, daemon=True).start()
+
     def apply_keybind_answers(self, session_id: str, answers: list[dict]):
         """answers: {control, device, decision: add|ignore|later, action_name, purpose}"""
         prof = self.profile
+        done = 0
         for a in answers:
             if a["decision"] == "later":
                 continue
-            status = "mapped" if a["decision"] == "add" else "ignored"
             if a["decision"] == "add":
-                name = re.sub(r"\W+", "_", (a.get("action_name") or a.get("purpose") or a["control"])
+                base = re.sub(r"\W+", "_", (a.get("action_name") or a.get("purpose") or a["control"])
                               .strip().lower()).strip("_") or a["control"]
-                prof["input_mapping"][name] = a["control"]
-                allowed = prof["constraints"].get("allowed_controls")
-                if allowed and a["control"] not in allowed:
-                    allowed.append(a["control"])
+                name, i = base, 2
+                while name in self.profile["input_mapping"]:
+                    name, i = f"{base}_{i}", i + 1
+                try:
+                    self.set_keybind(name, a["control"], a.get("purpose", ""))
+                    done += 1
+                except ValueError as exc:
+                    self.log.warning("keybinds", f"Could not add {a['control']}: {exc}",
+                                     event_id="KEYBIND_REJECTED")
             else:
-                ig = prof["constraints"].setdefault("ignored_controls", [])
+                ig = self.profile["constraints"].setdefault("ignored_controls", [])
                 if a["control"] not in ig:
                     ig.append(a["control"])
-            self.db.insert("keybinds", {
-                "profile_id": prof["_id"], "control": a["control"], "device": a.get("device", ""),
-                "action_name": a.get("action_name", ""), "purpose": a.get("purpose", ""),
-                "status": status, "source_session": session_id, "created": now_iso()})
-        self.profile = self.profiles.save(prof)
+                self.profile = self.profiles.save(self.profile)
+                self.db.insert("keybinds", {
+                    "profile_id": self.profile["_id"], "control": a["control"],
+                    "device": a.get("device", ""), "action_name": "", "purpose": a.get("purpose", ""),
+                    "status": "ignored", "source_session": session_id, "created": now_iso()})
+                done += 1
         self.log.info("keybinds", "Keybind answers saved to profile", event_id="KEYBINDS_SAVED",
-                      count=len([a for a in answers if a["decision"] != "later"]))
+                      count=done)
         self.on_state()
 
     # ---- auto-label ------------------------------------------------------
@@ -847,7 +971,7 @@ class AppController:
         threading.Thread(target=run, daemon=True, name="autolabel").start()
         return True
 
-    def apply_clusters(self, selections: list[tuple]) -> int:
+    def apply_clusters(self, selections: list[tuple], media_id: str = "") -> int:
         """selections: [(cluster, label)] - the human-approved labels."""
         troot = self.settings.path("templates_dir") / self.profile["_id"]
         n = 0
@@ -859,12 +983,9 @@ class AppController:
             stamp = int(time.time() * 1000)
             for i, smp in enumerate(cl["samples"][:3]):
                 imwrite(tdir / f"auto_{stamp}_{i}.png", smp["crop"])
-            self.db.insert_many("entities", [
-                {"session_id": "", "scan_frame": fi, "timestamp": time.time(), "label": label,
-                 "bbox": list(bb), "confidence": cl.get("match_confidence") or 0.5,
-                 "track_id": -1, "user_correction": False, "auto_label": True,
-                 "review_status": "approved", "source": "auto_label"}
-                for fi, bb in cl["all_boxes"][:50]])
+            self.save_labels([self.label_doc(
+                label, bb, "auto_label", media_id=media_id, frame_index=fi,
+                confidence=cl.get("match_confidence") or 0.5) for fi, bb in cl["all_boxes"][:50]])
             n += 1
         self.perception.reload_templates()
         self.log.info("autolabel", f"Applied {n} label group(s)", event_id="AUTOLABEL_APPLIED")
@@ -875,9 +996,16 @@ class AppController:
         lib = autolabel.load_library(self.settings.path("templates_dir"), self.profile["_id"])
         self.log.info("media", f"Analysing {path}", event_id="MEDIA_START")
         res = media.analyze_media(path, self.perception, lib, progress, stop)
-        self.db.insert("media", res.to_doc(self.profile["_id"]))
+        res.media_id = self.db.insert("media", res.to_doc(self.profile["_id"]))
+        rows = [self.label_doc(e.label, e.bbox, "media", media_id=res.media_id, frame_index=i,
+                               confidence=e.confidence, track_id=e.track_id, name=e.name,
+                               media_time=round(res.times[i], 3))
+                for i, ents in enumerate(res.entities) for e in ents]
+        if rows:
+            self.save_labels(rows)
         self.log.info("media", "Media analysis saved to database", event_id="MEDIA_DONE",
-                      frames=res.summary["frames_analyzed"], clusters=len(res.clusters))
+                      frames=res.summary["frames_analyzed"], clusters=len(res.clusters),
+                      labels_saved=len(rows))
         return res
 
     # ---- misc ----------------------------------------------------------

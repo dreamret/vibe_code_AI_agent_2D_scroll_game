@@ -29,12 +29,13 @@ class MediaResult:
     texts: list = field(default_factory=list)           # list[list[str]]
     summary: dict = field(default_factory=dict)
     clusters: list = field(default_factory=list)
+    media_id: str = ""
 
     def to_doc(self, profile_id: str) -> dict:
         return {"profile_id": profile_id, "path": self.info["path"], "type": self.info["type"],
                 "info": self.info, "summary": self.summary, "created": now_iso(),
-                "frames": [{"index": i, "t": round(t, 3),
-                            "entities": [e.to_dict() for e in ents], "text": txt[:20]}
+                "labels_table": "entities",   # per-frame detections are rows of `entities` (media_id)
+                "frames": [{"index": i, "t": round(t, 3), "entity_count": len(ents), "text": txt[:20]}
                            for i, (t, ents, txt) in enumerate(zip(self.times, self.entities, self.texts))],
                 "clusters": [{k: c[k] for k in ("id", "count", "hint", "suggested_label",
                                                 "match_confidence", "size", "known")}
@@ -275,5 +276,7 @@ def export_annotated(res: MediaResult, path: str):
 
 
 def export_report(res: MediaResult, profile_id: str, path: str):
-    Path(path).write_text(json.dumps(res.to_doc(profile_id), indent=1, ensure_ascii=False,
-                                     default=str), encoding="utf-8")
+    doc = res.to_doc(profile_id)
+    for fr, ents in zip(doc["frames"], res.entities):
+        fr["entities"] = [e.to_dict() for e in ents]
+    Path(path).write_text(json.dumps(doc, indent=1, ensure_ascii=False, default=str), encoding="utf-8")

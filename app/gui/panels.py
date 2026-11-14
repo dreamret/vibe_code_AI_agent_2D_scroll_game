@@ -57,6 +57,7 @@ class ClusterReview(QWidget):
         super().__init__()
         self.ctrl = ctrl
         self.clusters: list[dict] = []
+        self.media_id = ""
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.lbl = QLabel("No suggestions yet.")
@@ -124,7 +125,7 @@ class ClusterReview(QWidget):
         if not sel:
             QMessageBox.information(self, "Auto-label", "Tick at least one group.")
             return
-        n = self.ctrl.apply_clusters(sel)
+        n = self.ctrl.apply_clusters(sel, media_id=self.media_id)
         for r in reversed(rows):
             self.table.removeRow(r)
             del self.clusters[r]
@@ -335,6 +336,7 @@ class MediaPanel(QWidget):
         self.timer.stop()
         self.btn_play.setText("▶")
         self.result = res
+        self.review.media_id = res.media_id
         self.txt.setPlainText(media_mod.summary_text(res))
         self.slider.blockSignals(True)
         self.slider.setRange(0, len(res.frames) - 1)
@@ -387,8 +389,11 @@ SORTS = {"logs": ("timestamp", -1), "frames": ("timestamp", -1), "sessions": ("s
          "actions": ("timestamp", -1), "training_examples": ("created", -1), "models": ("version", -1),
          "profiles": ("name", 1), "entities": ("timestamp", -1), "elements": ("label", 1),
          "keybinds": ("created", -1), "media": ("created", -1)}
-PROFILE_SCOPED = {"elements", "keybinds", "training_examples", "models", "media", "sessions"}
+PROFILE_SCOPED = {"elements", "keybinds", "training_examples", "models", "media", "sessions", "entities"}
 ROW_LIMIT = 500
+PREFERRED_COLUMNS = {"entities": ["label", "source", "bbox", "confidence", "review_status",
+                                  "media_id", "session_id", "frame_index"],
+                     "keybinds": ["action_name", "control", "purpose", "status"]}
 
 
 class DbBrowser(QWidget):
@@ -410,13 +415,16 @@ class DbBrowser(QWidget):
         self.chk_profile = QCheckBox("current profile only")
         self.chk_profile.setChecked(True)
         self.chk_profile.toggled.connect(self.refresh)
+        self.cmb_source = QComboBox()                   # filter for the shared label table
+        self.cmb_source.addItems(["all sources", "detector", "correction", "auto_label", "media"])
+        self.cmb_source.currentTextChanged.connect(self.refresh)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search rows…")
         self.search.textChanged.connect(self._fill)
         self.lbl = QLabel("")
-        for w in (QLabel("Collection:"), self.cmb, self.chk_profile, self.search, self.lbl):
+        for w in (QLabel("Collection:"), self.cmb, self.chk_profile, self.cmb_source, self.search, self.lbl):
             top.addWidget(w)
-        top.setStretch(3, 1)
+        top.setStretch(4, 1)
         lay.addLayout(top)
         self.table = QTableWidget(0, 0)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -437,6 +445,9 @@ class DbBrowser(QWidget):
         self.chk_profile.setEnabled(scoped)
         if scoped and self.chk_profile.isChecked():
             q["profile_id"] = self.ctrl.profile["_id"]
+        self.cmb_source.setVisible(coll == "entities")
+        if coll == "entities" and self.cmb_source.currentIndex() > 0:
+            q["source"] = self.cmb_source.currentText()
         self._rows = self.ctrl.db.find(coll, q, limit=ROW_LIMIT, sort=SORTS.get(coll))
         self._fill()
 
@@ -458,6 +469,8 @@ class DbBrowser(QWidget):
             for k in r:
                 if k != "_id" and k not in keys:
                     keys.append(k)
+        first = PREFERRED_COLUMNS.get(self.cmb.currentText(), [])
+        keys = [k for k in first if k in keys] + [k for k in keys if k not in first]
         keys = keys[:9]
         self.table.setColumnCount(len(keys) + 1)
         self.table.setHorizontalHeaderLabels(["_id"] + keys)
@@ -596,3 +609,180 @@ class KeybindDialog(QDialog):
                         "decision": ["add", "ignore", "later"][dec.currentIndex()],
                         "action_name": name.currentText().strip(), "purpose": purpose.text().strip()})
         return out
+
+
+# ------------------------------------------------------------------ keybinds (= profile input mapping)
+COMMON_CONTROLS = (["space", "left", "right", "up", "down", "enter", "esc", "tab", "shift", "ctrl", "alt"]
+                   + list("zxcasdfqwer1234") + ["mouse_left", "mouse_right", "mouse_middle"]
+                   + [f"gamepad_button_{i}" for i in range(8)])
+
+
+class _Detector(QObject):
+    got = Signal(str)
+
+
+class KeybindDialog2(QDialog):
+    """Add / edit one keybind. 'Detect key' listens for the next physical key press."""
+
+    def __init__(self, parent, data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Keybind")
+        data = data or {}
+        self.old_action = data.get("action", "")
+        f = QFormLayout(self)
+        self.action = QLineEdit(self.old_action)
+        self.action.setPlaceholderText("e.g. attack, jump, heal_potion")
+        self.control = QComboBox()
+        self.control.setEditable(True)
+        self.control.addItems(COMMON_CONTROLS)
+        self.control.setCurrentText(data.get("control", ""))
+        self.btn_detect = _btn("Detect key…", self.detect)
+        self.purpose = QLineEdit(data.get("purpose", ""))
+        self.purpose.setPlaceholderText("what it does in the game")
+        row = QHBoxLayout()
+        row.addWidget(self.control, 1)
+        row.addWidget(self.btn_detect)
+        f.addRow("Action name:", self.action)
+        f.addRow("Key / button:", row)
+        f.addRow("Purpose:", self.purpose)
+        self.hint = QLabel("Keys: z, space, left, enter, shift, f5 … · Mouse: mouse_left/right/middle · "
+                           "Gamepad: gamepad_button_0…")
+        self.hint.setWordWrap(True)
+        f.addRow(self.hint)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        f.addRow(bb)
+        self._det = _Detector()
+        self._det.got.connect(self._detected)
+        self._listener = None
+
+    def detect(self):
+        try:
+            from pynput import keyboard
+            from ..input_recorder import key_name
+        except Exception as exc:
+            QMessageBox.warning(self, "Detect key", f"pynput is not available: {exc}")
+            return
+        self.btn_detect.setText("Press a key…")
+        self.btn_detect.setEnabled(False)
+
+        def on_press(key):
+            self._det.got.emit(key_name(key))
+            return False                                  # stop after the first key
+        self._listener = keyboard.Listener(on_press=on_press)
+        self._listener.start()
+        QTimer.singleShot(10000, self._detect_timeout)
+
+    def _detect_timeout(self):
+        if self._listener and self._listener.running:
+            self._listener.stop()
+        self.btn_detect.setText("Detect key…")
+        self.btn_detect.setEnabled(True)
+
+    def _detected(self, name: str):
+        self.control.setCurrentText(name)
+        self.btn_detect.setText("Detect key…")
+        self.btn_detect.setEnabled(True)
+
+    def done(self, r):
+        if self._listener and self._listener.running:
+            self._listener.stop()
+        super().done(r)
+
+    def values(self) -> dict:
+        return {"action": self.action.text(), "control": self.control.currentText(),
+                "purpose": self.purpose.text(), "old_action": self.old_action}
+
+
+class KeybindsPanel(QWidget):
+    changed = Signal()
+
+    def __init__(self, ctrl, compare_cb):
+        super().__init__()
+        self.ctrl = ctrl
+        self._rows: list[dict] = []
+        lay = QVBoxLayout(self)
+        info = QLabel("These are the game's keybinds = the profile's input mapping. The agent only sends "
+                      "keys listed here. Use 'Test' to check that the game reacts to the chosen input mode.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Action", "Key / button", "Device", "Purpose", "Status"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.doubleClicked.connect(self.edit)
+        lay.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        for text, fn in (("Add…", self.add), ("Edit…", self.edit), ("Delete", self.delete),
+                         ("Un-ignore", self.unignore), ("Test key", self.test),
+                         ("Compare with a demo…", compare_cb), ("Refresh", self.refresh)):
+            row.addWidget(_btn(text, fn))
+        lay.addLayout(row)
+
+    def refresh(self):
+        self._rows = self.ctrl.list_keybinds()
+        self.table.setRowCount(len(self._rows))
+        for r, k in enumerate(self._rows):
+            for c, v in enumerate([k["action"] or "—", k["control"], k["device"], k["purpose"],
+                                   "mapped" if k["status"] == "mapped" else "ignored (never sent)"]):
+                self.table.setItem(r, c, QTableWidgetItem(str(v)))
+
+    def _current(self):
+        rows = self.table.selectionModel().selectedRows()
+        return self._rows[rows[0].row()] if rows else None
+
+    def _save(self, v: dict) -> bool:
+        try:
+            self.ctrl.set_keybind(v["action"], v["control"], v["purpose"], v["old_action"])
+            return True
+        except ValueError as exc:
+            QMessageBox.warning(self, "Keybind", str(exc))
+            return False
+
+    def add(self):
+        d = KeybindDialog2(self)
+        while d.exec() == QDialog.DialogCode.Accepted:
+            if self._save(d.values()):
+                self.refresh()
+                self.changed.emit()
+                break
+
+    def edit(self, *_):
+        cur = self._current()
+        if not cur or cur["status"] != "mapped":
+            return
+        d = KeybindDialog2(self, cur)
+        while d.exec() == QDialog.DialogCode.Accepted:
+            if self._save(d.values()):
+                self.refresh()
+                self.changed.emit()
+                break
+
+    def delete(self):
+        cur = self._current()
+        if cur and cur["status"] == "mapped" and QMessageBox.question(
+                self, "Delete", f"Remove keybind '{cur['action']}' ({cur['control']})?") == \
+                QMessageBox.StandardButton.Yes:
+            self.ctrl.remove_keybind(cur["action"])
+            self.refresh()
+            self.changed.emit()
+
+    def unignore(self):
+        cur = self._current()
+        if cur and cur["status"] == "ignored":
+            self.ctrl.unignore_control(cur["control"])
+            self.refresh()
+
+    def test(self):
+        cur = self._current()
+        if not cur:
+            return
+        r = self.ctrl.router
+        if not r.enabled:
+            QMessageBox.information(self, "Test key", "Switch on 'Enable input execution' in the "
+                                    "Assist / Replay menu first (safety switch).")
+            return
+        self.ctrl.test_keybind(cur["control"])

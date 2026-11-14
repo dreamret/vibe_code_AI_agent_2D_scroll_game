@@ -27,6 +27,12 @@ if IS_WINDOWS:
     kernel32.QueryFullProcessImageNameW.argtypes = [
         wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    user32.ScreenToClient.argtypes = [H, ctypes.POINTER(wintypes.POINT)]
+    user32.ChildWindowFromPointEx.argtypes = [H, wintypes.POINT, wintypes.UINT]
+    user32.ChildWindowFromPointEx.restype = wintypes.HWND
+    user32.PostMessageW.argtypes = [H, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+    user32.VkKeyScanW.argtypes = [wintypes.WCHAR]
 
 
 def _process_name(pid: int) -> str:
@@ -109,3 +115,49 @@ def window_title(hwnd: int) -> str:
     buf = ctypes.create_unicode_buffer(n + 1)
     user32.GetWindowTextW(hwnd, buf, n + 1)
     return buf.value
+
+
+def is_minimized(hwnd: int) -> bool:
+    return bool(IS_WINDOWS and hwnd and user32.IsIconic(hwnd))
+
+
+def deepest_child(hwnd: int) -> int:
+    """The innermost child window at the centre of the client area (e.g. the render widget
+    of a Chromium/NW.js game). Falls back to the top-level window."""
+    if not IS_WINDOWS or not hwnd:
+        return hwnd
+    r = client_rect(hwnd)
+    if not r:
+        return hwnd
+    cx, cy = r["left"] + r["width"] // 2, r["top"] + r["height"] // 2
+    cur = hwnd
+    for _ in range(8):
+        pt = wintypes.POINT(cx, cy)
+        user32.ScreenToClient(cur, ctypes.byref(pt))
+        child = int(user32.ChildWindowFromPointEx(cur, pt, 0x0003) or 0)   # skip invisible+disabled
+        if not child or child == cur:
+            break
+        cur = child
+    return cur
+
+
+def client_point(hwnd: int, top_hwnd: int, x: int, y: int) -> tuple[int, int]:
+    """(x, y) given in the client coordinates of `top_hwnd` -> client coords of `hwnd`."""
+    r = client_rect(top_hwnd)
+    if not IS_WINDOWS or not r:
+        return x, y
+    pt = wintypes.POINT(r["left"] + x, r["top"] + y)
+    user32.ScreenToClient(hwnd, ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
+
+
+def post_message(hwnd: int, msg: int, wparam: int, lparam: int) -> bool:
+    return bool(IS_WINDOWS and user32.PostMessageW(hwnd, msg, wparam, lparam & 0xFFFFFFFFFFFFFFFF))
+
+
+def map_vk_to_scan(vk: int) -> int:
+    return int(user32.MapVirtualKeyW(vk, 0)) if IS_WINDOWS else 0
+
+
+def vk_from_char(ch: str) -> int:
+    return (int(user32.VkKeyScanW(ch)) & 0xFF) if IS_WINDOWS else 0

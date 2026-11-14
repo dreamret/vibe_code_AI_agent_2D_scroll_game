@@ -20,7 +20,7 @@ from .. import APP_NAME, winutil
 from ..gpu import accel as gpu_accel
 from ..controller import AppController
 from .panels import (ClusterReview, DbBrowser, ElementsPanel, JsonEditDialog as JsonDialog,
-                     KeybindDialog, MediaPanel)
+                     KeybindDialog, KeybindsPanel, MediaPanel)
 from .widgets import LogPanel, PreviewWidget
 
 STATE_STYLE = {
@@ -133,6 +133,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_scene_tab(), "Scene")
         self.tabs.addTab(self._build_action_tab(), "Actions")
+        self.keybinds = KeybindsPanel(self.ctrl, self.keybind_compare_menu)
+        self.tabs.addTab(self.keybinds, "Keybinds")
         self.tabs.addTab(self._build_correction_tab(), "Corrections")
         self.tabs.addTab(self._build_autolabel_tab(), "Auto-label")
         self.elements = ElementsPanel(self.ctrl)
@@ -323,7 +325,9 @@ class MainWindow(QMainWindow):
 
     def on_tab_changed(self, i):
         w = self.tabs.widget(i)
-        if w is self.elements:
+        if w is self.keybinds:
+            self.keybinds.refresh()
+        elif w is self.elements:
             self.elements.refresh()
         elif w is self.dbbrowser:
             self.dbbrowser.refresh()
@@ -398,6 +402,8 @@ class MainWindow(QMainWindow):
     SETTING_FIELDS = [
         ("capture_fps", "int", "Capture FPS", (1, 60)),
         ("capture_scale", "float", "Capture scale", (0.25, 1.0)),
+        ("input_mode", "choice", "Input output (window_message = straight to the game window; os_input = system keyboard/mouse)", ["window_message", "os_input"]),
+        ("post_to_child_window", "bool", "window_message: target the innermost child window", None),
         ("capture_backend", "choice", "Capture backend (auto = GPU if dxcam installed)", ["auto", "dxcam", "mss"]),
         ("gpu_device_index", "int", "GPU adapter index (0 = primary)", (0, 8)),
         ("gpu_opencl", "bool", "OpenCL image processing (restart to apply)", None),
@@ -540,6 +546,7 @@ class MainWindow(QMainWindow):
         self.cmb_profile.setCurrentIndex(max(0, i))
         self.cmb_profile.blockSignals(False)
         self.refresh_labels()
+        self.keybinds.refresh()
 
     def refresh_labels(self):
         cur = self.cmb_label.currentText()
@@ -594,8 +601,12 @@ class MainWindow(QMainWindow):
         if on and not self._warned_execution:
             r = QMessageBox.warning(
                 self, "Enable input execution",
-                "The application will send keyboard/mouse/gamepad input to the selected "
-                "window.\n\nThis may violate the game's terms of service or trigger anti-cheat. "
+                ("The application will send input DIRECTLY to the selected game window as window "
+                 "messages (no system keyboard/mouse output, no focus needed)."
+                 if self.ctrl.settings["input_mode"] == "window_message" else
+                 "The application will send system-level keyboard/mouse/gamepad input to the "
+                 "focused game window.") +
+                "\n\nThis may violate the game's terms of service or trigger anti-cheat. "
                 "Use only where permitted. Press the emergency hotkey "
                 f"({self.ctrl.settings['emergency_hotkey'].upper()}) or STOP to halt at any time.\n\n"
                 "Enable?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -930,7 +941,7 @@ class MainWindow(QMainWindow):
         s = cap.stats
         self.lbl_status.setText(
             f"Capture {'OK' if cap.ok else ('LOST' if cap.running else 'idle')} [{cap.backend_name}] "
-            f"OpenCL {'on' if gpu_accel.enabled else 'off'} | "
+            f"OpenCL {'on' if gpu_accel.enabled else 'off'} | input: {self.ctrl.settings['input_mode']} | "
             f"{s['fps']:.1f} fps | frames {s['frames']} | drops {s['drops']} | "
             f"failures {s['failures']} | perception {self.ctrl.perception.avg_ms:.0f} ms | "
             f"policy {'v' + str(self.ctrl.profile.get('model_version')) if self.ctrl.policy else 'none'}")

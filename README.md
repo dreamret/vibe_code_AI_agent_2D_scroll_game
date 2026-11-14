@@ -33,6 +33,23 @@ Recognised text is used for CAPTCHA keywords (EN/zh-TW/ja-JP built in, more via 
 text-language indicator in the Scene tab. Note: Traditional vs Simplified Chinese is reported as `zh`.
 The window/menu text of the app itself is still English.
 
+## One label table, keybinds, and how inputs are sent
+* **Labels:** every label from corrections, auto-label, media analysis and recording detections is a row in the
+  **`entities`** collection (same fields: `label`, `bbox`, `confidence`, `source` = `detector` / `correction` /
+  `auto_label` / `media`, `profile_id`, `media_id`/`session_id`, `frame_index`, `review_status`). Filter by source in the
+  Database tab. Older rows are normalised automatically at start-up. The Media collection only keeps the summary.
+* **Keybinds tab:** the game keybinds *are* the profile's input mapping – add, rename, rebind, delete, un-ignore,
+  **Detect key** (press the key) and **Test key** from the GUI. Purposes are stored in the `keybinds` collection.
+  Duplicate keys / unknown key names are refused; the demo comparison uses the same table.
+* **Input output (Settings → Input output):**
+  * `window_message` (default) – inputs are posted **directly to the game window** (WM_KEYDOWN/UP, mouse messages to its
+    innermost child window). No system keyboard/mouse output, no focus needed, your real keyboard is not touched.
+    Works for games that read window messages (many SDL/GLFW/Win32/Chromium-based 2D games). Games that read
+    DirectInput / RawInput / GetAsyncKeyState ignore it, and a game running as administrator ignores a normal app
+    (run both elevated). Gamepad/touch can't be sent this way.
+  * `os_input` – the previous method (system-level keyboard/mouse, game must be focused; virtual gamepad via vgamepad).
+  Use **Keybinds → Test key** to see whether your game reacts to the mode you picked.
+
 ## Auto-label, elements, keybinds, media
 * **Auto-label tab** – *Scan live capture*: finds recurring unlabelled elements (edges + motion), groups look-alikes
   and suggests a label (nearest known template, otherwise a hint such as `ui` / `moving_entity`). Tick the groups, fix the

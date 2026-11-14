@@ -11,7 +11,7 @@ import cv2
 
 from app.db import match, clean
 from app.learning import StateEncoder, edit_similarity, compare_examples, remap_vector
-from app import autolabel, gpu
+from app import action_router, autolabel, gpu
 from app.perception import OnnxYoloDetector
 from app.perception import (TemplateDetector, Tracker, detect_captcha, detect_text_language,
                             extract_scene, infer_class, normalize_text)
@@ -168,6 +168,25 @@ class TestGpuPaths(unittest.TestCase):
         ents = OnnxYoloDetector.decode(out, .4, .45, 0.5, 0, 140, {0: "slime"}, (1280, 720))
         self.assertEqual(len(ents), 1)
         self.assertEqual((ents[0].label, ents[0].bbox), ("slime", (576, 296, 128, 128)))
+
+
+class TestKeybindsAndInput(unittest.TestCase):
+    def test_validate_control(self):
+        v = action_router.validate_control
+        self.assertEqual(v(" Z "), "z")
+        self.assertEqual(v("SPACE"), "space")
+        self.assertEqual(v("mouse_left"), "mouse_left")
+        self.assertEqual(v("gamepad_button_3"), "gamepad_button_3")
+        for bad in ("", "mouse_foo", "gamepad_button_x", "notakey"):
+            with self.assertRaises(ValueError):
+                v(bad)
+
+    def test_virtual_key_codes(self):
+        self.assertEqual(action_router.vk_for("z"), 0x5A)
+        self.assertEqual(action_router.vk_for("left"), 0x25)
+        self.assertEqual(action_router.vk_for("f5"), 0x74)
+        self.assertEqual(action_router.vk_for("1"), 0x31)
+        self.assertIn(0x25, action_router.EXTENDED)
 
 
 class TestLearning(unittest.TestCase):

@@ -37,6 +37,8 @@ DEFAULTS = {
     "tesseract_cmd": "",
     "ocr_languages": "eng+chi_tra+jpn",  # Tesseract codes: English, zh-TW, ja-JP
     # --- automation safety ---------------------------------------------
+    "input_mode": "window_message",      # window_message = straight to the game window | os_input = system keyboard/mouse
+    "post_to_child_window": True,        # window_message: target the innermost child window
     "emergency_hotkey": "f12",
     "max_actions_per_second": 10,
     "min_confidence": 0.45,
