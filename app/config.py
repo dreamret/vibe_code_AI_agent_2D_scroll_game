@@ -24,6 +24,11 @@ DEFAULTS = {
     # --- capture --------------------------------------------------------
     "capture_fps": 15,
     "capture_scale": 1.0,
+    "capture_backend": "auto",           # auto | dxcam (GPU, DXGI) | mss (CPU)
+    "gpu_device_index": 0,               # DXGI adapter index (0 = primary GPU)
+    "gpu_opencl": True,                  # OpenCL (AMD) image processing via cv2.UMat
+    "record_encoder": "auto",            # auto | amf (AMD hardware H.264) | cpu
+    "ffmpeg_path": "",                   # empty = use ffmpeg from PATH
     "record_video": True,
     "save_frame_every_n": 15,            # sampled frame + detections stored in DB
     # --- perception -----------------------------------------------------

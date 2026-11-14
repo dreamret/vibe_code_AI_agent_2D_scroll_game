@@ -29,7 +29,8 @@ PROFILE_TEMPLATE = {
         "labels": DEFAULT_LABELS,
         "template_threshold": 0.80,
         "detect_scale": 0.5,
-        "yolo_model": "",             # path to a YOLO .pt file (needs `ultralytics`)
+        "yolo_model": "",             # .onnx = GPU via DirectML (AMD ok); .pt needs `ultralytics`
+        "yolo_classes": [],           # class names if the .onnx file has no embedded names
         "yolo_confidence": 0.4,
         "use_ocr": False,
         "captcha_keywords": [],       # extra keywords, besides the built-in list
@@ -38,6 +39,7 @@ PROFILE_TEMPLATE = {
     "constraints": {
         # empty list = only controls listed in input_mapping are allowed
         "allowed_controls": [],
+        "ignored_controls": [],       # keys the user said to never replay (asked once)
         "max_actions_per_second": 10,
     },
     "model_version": 0,

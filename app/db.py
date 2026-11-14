@@ -19,8 +19,8 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
-COLLECTIONS = ["profiles", "sessions", "frames", "entities", "actions",
-               "training_examples", "models", "logs"]
+COLLECTIONS = ["profiles", "elements", "keybinds", "sessions", "frames", "entities", "actions",
+               "training_examples", "models", "media", "logs"]
 
 # (collection, field(s)) indexes created on MongoDB
 MONGO_INDEXES = {
@@ -31,6 +31,9 @@ MONGO_INDEXES = {
     "training_examples": ["profile_id", "review_status", "source_session"],
     "models": ["profile_id", "version"],
     "logs": ["timestamp", "level", "component"],
+    "elements": ["profile_id", "label"],
+    "keybinds": ["profile_id", "control"],
+    "media": ["profile_id", "created"],
 }
 
 
@@ -111,6 +114,11 @@ class _TinyBackend:
     def update(self, coll, _id, changes):
         self._db.table(coll).update(changes, lambda d: d.get("_id") == _id)
 
+    def replace(self, coll, _id, doc):
+        t = self._db.table(coll)
+        t.remove(lambda d: d.get("_id") == _id)
+        t.insert(doc)
+
     def delete(self, coll, query):
         return len(self._db.table(coll).remove(lambda d: match(d, query)))
 
@@ -159,6 +167,9 @@ class _MongoBackend:
 
     def update(self, coll, _id, changes):
         self._db[coll].update_one({"_id": _id}, {"$set": changes})
+
+    def replace(self, coll, _id, doc):
+        self._db[coll].replace_one({"_id": _id}, doc, upsert=True)
 
     def delete(self, coll, query):
         return self._db[coll].delete_many(query or {}).deleted_count
@@ -244,6 +255,13 @@ class Database:
     def update(self, coll: str, _id: str, changes: dict) -> None:
         with self._lock:
             self.backend.update(coll, _id, clean(changes))
+
+    def replace(self, coll: str, _id: str, doc: dict) -> None:
+        """Replace a whole document (removed keys really disappear)."""
+        doc = clean(doc)
+        doc["_id"] = _id
+        with self._lock:
+            self.backend.replace(coll, _id, doc)
 
     def delete(self, coll: str, query: dict) -> int:
         with self._lock:

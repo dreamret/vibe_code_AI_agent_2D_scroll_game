@@ -10,6 +10,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .gpu import accel
+from .imgio import imread
+
 BUILTIN_CAPTCHA_KEYWORDS = [
     "captcha", "recaptcha", "hcaptcha", "i'm not a robot", "i am not a robot",
     "verify you are human", "verify you're human", "are you human",
@@ -117,7 +120,7 @@ class TemplateDetector:
         for label_dir in sorted(p for p in self.dir.iterdir() if p.is_dir()):
             items = []
             for f in sorted(label_dir.glob("*.png")) + sorted(label_dir.glob("*.jpg")):
-                img = cv2.imread(str(f), cv2.IMREAD_COLOR)
+                img = imread(f)
                 if img is None:
                     continue
                 g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -125,7 +128,7 @@ class TemplateDetector:
                     g = cv2.resize(g, None, fx=self.scale, fy=self.scale,
                                    interpolation=cv2.INTER_AREA)
                 if g.shape[0] >= 4 and g.shape[1] >= 4:
-                    items.append((f.stem, g))
+                    items.append((f.stem, g, accel.up(g)))      # numpy + (OpenCL) UMat copy
                     count += 1
             if items:
                 self.templates[label_dir.name] = items
@@ -136,9 +139,20 @@ class TemplateDetector:
                skip_special: bool = True) -> list[Entity]:
         if not self.templates:
             return []
-        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if accel.enabled:
+            try:
+                return self._detect(frame, only, skip_special, True)
+            except cv2.error as exc:                  # driver/OpenCL problem -> CPU for good
+                accel.disable(self.log, str(exc)[:120])
+        return self._detect(frame, only, skip_special, False)
+
+    def _detect(self, frame, only, skip_special, gpu: bool) -> list[Entity]:
+        h, w = frame.shape[:2]
+        gw, gh = max(1, int(round(w * self.scale))), max(1, int(round(h * self.scale)))
+        src = cv2.UMat(frame) if gpu else frame
+        g = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
         if self.scale != 1.0:
-            g = cv2.resize(g, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
+            g = cv2.resize(g, (gw, gh), interpolation=cv2.INTER_AREA)
         out: list[Entity] = []
         for label, items in self.templates.items():
             if only is not None and label != only:
@@ -146,11 +160,12 @@ class TemplateDetector:
             if only is None and skip_special and label.startswith("_"):
                 continue
             boxes, scores, names = [], [], []
-            for name, tpl in items:
+            for name, tpl, tpl_u in items:
                 th, tw = tpl.shape[:2]
-                if th >= g.shape[0] or tw >= g.shape[1]:
+                if th >= gh or tw >= gw:
                     continue
-                res = cv2.matchTemplate(g, tpl, cv2.TM_CCOEFF_NORMED)
+                res = cv2.matchTemplate(g, tpl_u if gpu else tpl, cv2.TM_CCOEFF_NORMED)
+                res = accel.down(res)
                 ys, xs = np.where(res >= self.threshold)
                 if len(xs) == 0:
                     continue
@@ -163,9 +178,9 @@ class TemplateDetector:
                 continue
             keep = cv2.dnn.NMSBoxes(boxes, scores, self.threshold, 0.3)
             for i in np.array(keep).flatten():
-                x, y, w, h = boxes[int(i)]
+                x, y, bw, bh = boxes[int(i)]
                 inv = 1.0 / self.scale
-                out.append(Entity(label, (int(x * inv), int(y * inv), int(w * inv), int(h * inv)),
+                out.append(Entity(label, (int(x * inv), int(y * inv), int(bw * inv), int(bh * inv)),
                                   scores[int(i)], names[int(i)], source="template"))
         return out
 
@@ -188,6 +203,78 @@ class YoloDetector:
             out.append(Entity(name, (int(x1), int(y1), int(x2 - x1), int(y2 - y1)),
                               float(b.conf[0]), name, source="yolo"))
         return out
+
+
+class OnnxYoloDetector:
+    """YOLOv8/YOLO11-style ONNX model on the GPU through ONNX Runtime + DirectML
+    (works on AMD). Export once:  yolo export model=best.pt format=onnx
+    Needs `pip install onnxruntime-directml`."""
+
+    def __init__(self, model_path: str, conf: float, log, class_names=None, iou: float = 0.45):
+        import ast
+        import onnxruntime as ort
+        avail = ort.get_available_providers()
+        providers = [p for p in ("DmlExecutionProvider", "CPUExecutionProvider") if p in avail]
+        self.sess = ort.InferenceSession(model_path, providers=providers)
+        inp = self.sess.get_inputs()[0]
+        self.input_name = inp.name
+        shp = inp.shape
+        self.h = shp[2] if isinstance(shp[2], int) else 640
+        self.w = shp[3] if isinstance(shp[3], int) else 640
+        self.conf, self.iou = conf, iou
+        names = None
+        try:
+            raw = self.sess.get_modelmeta().custom_metadata_map.get("names")
+            if raw:
+                names = ast.literal_eval(raw)
+        except Exception:
+            pass
+        self.names = {int(k): v for k, v in names.items()} if isinstance(names, dict) else \
+            {i: n for i, n in enumerate(class_names or [])}
+        used = self.sess.get_providers()[0]
+        log.info("perception", f"ONNX YOLO loaded ({used}): {model_path}", event_id="YOLO_ONNX",
+                 gpu="Dml" in used)
+        if "Dml" not in used:
+            log.warning("perception", "DirectML provider not active - YOLO runs on the CPU. "
+                        "pip install onnxruntime-directml", event_id="YOLO_ONNX_CPU")
+
+    @staticmethod
+    def decode(out: np.ndarray, conf: float, iou: float, r: float, px: int, py: int,
+               names: dict, frame_wh) -> list[Entity]:
+        """out: (1, 4+nc, N) or (1, N, 4+nc); boxes are cx,cy,w,h in letter-boxed input pixels."""
+        pred = out[0]
+        if pred.shape[0] < pred.shape[1]:
+            pred = pred.T
+        scores = pred[:, 4:]
+        cls = scores.argmax(1)
+        confs = scores.max(1)
+        keep = confs >= conf
+        if not keep.any():
+            return []
+        pred, cls, confs = pred[keep], cls[keep], confs[keep]
+        fw, fh = frame_wh
+        boxes = []
+        for cx, cy, bw, bh in pred[:, :4]:
+            x = max(0.0, (cx - bw / 2 - px) / r)
+            y = max(0.0, (cy - bh / 2 - py) / r)
+            boxes.append([int(x), int(y), int(min(bw / r, fw - x)), int(min(bh / r, fh - y))])
+        idx = cv2.dnn.NMSBoxes(boxes, [float(c) for c in confs], conf, iou)
+        res = []
+        for i in np.array(idx).flatten():
+            name = str(names.get(int(cls[int(i)]), int(cls[int(i)])))
+            res.append(Entity(name, tuple(boxes[int(i)]), float(confs[int(i)]), name, source="yolo-onnx"))
+        return res
+
+    def detect(self, frame: np.ndarray) -> list[Entity]:
+        h0, w0 = frame.shape[:2]
+        r = min(self.w / w0, self.h / h0)
+        nw, nh = int(round(w0 * r)), int(round(h0 * r))
+        canvas = np.full((self.h, self.w, 3), 114, np.uint8)
+        px, py = (self.w - nw) // 2, (self.h - nh) // 2
+        canvas[py:py + nh, px:px + nw] = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        blob = np.ascontiguousarray(canvas[:, :, ::-1].transpose(2, 0, 1)[None], dtype=np.float32) / 255.0
+        out = self.sess.run(None, {self.input_name: blob})[0]
+        return self.decode(out, self.conf, self.iou, r, px, py, self.names, (w0, h0))
 
 
 class OcrEngine:
@@ -373,7 +460,11 @@ class PerceptionService:
         self.yolo = None
         if d.get("yolo_model"):
             try:
-                self.yolo = YoloDetector(d["yolo_model"], d["yolo_confidence"], self.log)
+                if str(d["yolo_model"]).lower().endswith(".onnx"):     # GPU via DirectML (AMD ok)
+                    self.yolo = OnnxYoloDetector(d["yolo_model"], d["yolo_confidence"], self.log,
+                                                 d.get("yolo_classes"))
+                else:
+                    self.yolo = YoloDetector(d["yolo_model"], d["yolo_confidence"], self.log)
             except Exception as exc:
                 self.log.error("perception", f"YOLO unavailable: {exc}", event_id="YOLO_FAIL")
         self.ocr = None

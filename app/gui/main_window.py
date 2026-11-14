@@ -17,7 +17,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, winutil
+from ..gpu import accel as gpu_accel
 from ..controller import AppController
+from .panels import (ClusterReview, DbBrowser, ElementsPanel, JsonEditDialog as JsonDialog,
+                     KeybindDialog, MediaPanel)
 from .widgets import LogPanel, PreviewWidget
 
 STATE_STYLE = {
@@ -33,22 +36,7 @@ class Bridge(QObject):
     proposal = Signal(object)
     action = Signal(object)
     notice = Signal(str, str)
-
-
-class JsonDialog(QDialog):
-    def __init__(self, parent, title, text):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(640, 640)
-        lay = QVBoxLayout(self)
-        self.edit = QPlainTextEdit(text)
-        self.edit.setFont(QFont("Consolas", 10))
-        lay.addWidget(self.edit)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
-                              QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
+    clusters = Signal(object, str)
 
 
 class MainWindow(QMainWindow):
@@ -67,11 +55,13 @@ class MainWindow(QMainWindow):
         ctrl.on_proposal = self.bridge.proposal.emit
         ctrl.on_action = self.bridge.action.emit
         ctrl.on_notice = self.bridge.notice.emit
+        ctrl.on_autolabel = self.bridge.clusters.emit
         ctrl.log.subscribe(self._log_queue.append)
         self.bridge.state.connect(self.refresh_state)
         self.bridge.proposal.connect(self.show_proposal)
         self.bridge.action.connect(self.add_action_row)
         self.bridge.notice.connect(lambda t, m: QMessageBox.warning(self, t, m))
+        self.bridge.clusters.connect(self.on_clusters)
 
         self._build_menu()
         self._build_ui()
@@ -144,8 +134,20 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_scene_tab(), "Scene")
         self.tabs.addTab(self._build_action_tab(), "Actions")
         self.tabs.addTab(self._build_correction_tab(), "Corrections")
+        self.tabs.addTab(self._build_autolabel_tab(), "Auto-label")
+        self.elements = ElementsPanel(self.ctrl)
+        self.elements.changed.connect(self.on_elements_changed)
+        self.tabs.addTab(self.elements, "Elements")
+        self.media = MediaPanel(self.ctrl)
+        self.media.review.applied.connect(self.on_elements_changed)
+        self.tabs.addTab(self.media, "Media")
         self.tabs.addTab(self._build_learning_tab(), "Learning")
+        self.dbbrowser = DbBrowser(self.ctrl)
+        self.dbbrowser.changed.connect(self.on_db_changed)
+        self.tabs.addTab(self.dbbrowser, "Database")
         self.tabs.addTab(self._build_settings_tab(), "Settings")
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         hs = QSplitter(Qt.Orientation.Horizontal)
         hs.addWidget(self.preview)
         hs.addWidget(self.tabs)
@@ -280,6 +282,77 @@ class MainWindow(QMainWindow):
             lambda s: self.lbl_sel.setText(f"x={s[0]} y={s[1]} w={s[2]} h={s[3]}"))
         return w
 
+    def _build_autolabel_tab(self) -> QWidget:
+        w = QWidget()
+        l = QVBoxLayout(w)
+        info = QLabel("Scans the live capture for recurring elements that are not labelled yet, groups "
+                      "look-alikes and suggests labels. Move around in the game while it scans. "
+                      "Nothing is saved until you tick groups and press Apply.")
+        info.setWordWrap(True)
+        l.addWidget(info)
+        row = QHBoxLayout()
+        self.spn_scan = QSpinBox()
+        self.spn_scan.setRange(2, 30)
+        self.spn_scan.setValue(6)
+        self.spn_scan.setSuffix(" s")
+        b = self._btn("Scan live capture")
+        b.clicked.connect(lambda: self.ctrl.scan_live(self.spn_scan.value()))
+        row.addWidget(QLabel("Scan length:"))
+        row.addWidget(self.spn_scan)
+        row.addWidget(b)
+        row.addStretch(1)
+        l.addLayout(row)
+        self.autolabel_review = ClusterReview(self.ctrl)
+        self.autolabel_review.applied.connect(self.on_elements_changed)
+        l.addWidget(self.autolabel_review, 1)
+        return w
+
+    def on_clusters(self, clusters, source):
+        self.autolabel_review.set_clusters(clusters, source)
+        self.tabs.setCurrentWidget(self.autolabel_review.parentWidget())
+
+    def on_elements_changed(self):
+        self.refresh_labels()
+        self.refresh_profiles()
+        self.elements.refresh()
+
+    def on_db_changed(self, coll):
+        self.ctrl.after_db_edit(coll)
+        self.refresh_profiles()
+        self.refresh_learning()
+
+    def on_tab_changed(self, i):
+        w = self.tabs.widget(i)
+        if w is self.elements:
+            self.elements.refresh()
+        elif w is self.dbbrowser:
+            self.dbbrowser.refresh()
+
+    # ---- keybind review
+    def review_keybinds(self, session_id, always=False) -> None:
+        if not session_id:
+            return
+        a = self.ctrl.analyze_keybinds(session_id)
+        if not a["unmapped"] and not always:
+            return
+        dlg = KeybindDialog(self, a)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            ans = dlg.answers()
+            if any(x["decision"] != "later" for x in ans):
+                self.ctrl.apply_keybind_answers(session_id, ans)
+                self.refresh_profiles()
+
+    def keybind_compare_menu(self):
+        sessions = self.ctrl.list_sessions()
+        if not sessions:
+            QMessageBox.information(self, "Keybinds", "No completed recording sessions yet.")
+            return
+        items = [f"{datetime.fromtimestamp(s['start_time']).strftime('%Y-%m-%d %H:%M')} | "
+                 f"{s['application'].get('title', '')[:40]} | {s['_id'][:8]}" for s in sessions]
+        item, ok = QInputDialog.getItem(self, "Compare keybinds", "Demo session:", items, 0, False)
+        if ok:
+            self.review_keybinds(sessions[items.index(item)]["_id"], always=True)
+
     def _build_learning_tab(self) -> QWidget:
         w = QWidget()
         l = QVBoxLayout(w)
@@ -325,6 +398,11 @@ class MainWindow(QMainWindow):
     SETTING_FIELDS = [
         ("capture_fps", "int", "Capture FPS", (1, 60)),
         ("capture_scale", "float", "Capture scale", (0.25, 1.0)),
+        ("capture_backend", "choice", "Capture backend (auto = GPU if dxcam installed)", ["auto", "dxcam", "mss"]),
+        ("gpu_device_index", "int", "GPU adapter index (0 = primary)", (0, 8)),
+        ("gpu_opencl", "bool", "OpenCL image processing (restart to apply)", None),
+        ("record_encoder", "choice", "Video encoder (amf = AMD hardware)", ["auto", "amf", "cpu"]),
+        ("ffmpeg_path", "str", "ffmpeg executable (optional)", None),
         ("record_video", "bool", "Record video (mp4)", None),
         ("save_frame_every_n", "int", "Store frame + detections every N frames", (1, 600)),
         ("recordings_dir", "str", "Recording folder", None),
@@ -370,15 +448,24 @@ class MainWindow(QMainWindow):
             f.addRow(label + ":", x)
         b = self._btn("Save settings")
         b.clicked.connect(self.on_save_settings)
-        f.addRow(b)
+        g = self._btn("GPU check…")
+        g.clicked.connect(self.show_gpu_report)
+        row = QHBoxLayout()
+        row.addWidget(b)
+        row.addWidget(g)
+        f.addRow(row)
         return w
+
+    def show_gpu_report(self):
+        QMessageBox.information(self, "GPU check", self.ctrl.gpu_report_text())
 
     def _build_menu(self):
         mb = self.menuBar()
         pm = mb.addMenu("&Profile")
         for text, fn in (("New profile…", self.profile_new), ("Clone…", self.profile_clone),
                          ("Edit (JSON)…", self.profile_edit), ("Import…", self.profile_import),
-                         ("Export…", self.profile_export), ("Delete", self.profile_delete)):
+                         ("Export…", self.profile_export), ("Delete", self.profile_delete),
+                         ("Compare keybinds with a demo…", self.keybind_compare_menu)):
             a = QAction(text, self)
             a.triggered.connect(fn)
             pm.addAction(a)
@@ -393,6 +480,9 @@ class MainWindow(QMainWindow):
             a.triggered.connect(fn)
             dm.addAction(a)
         hm = mb.addMenu("&Help")
+        a = QAction("GPU check…", self)
+        a.triggered.connect(self.show_gpu_report)
+        hm.addAction(a)
         a = QAction("Safety & limitations", self)
         a.triggered.connect(self.show_notice)
         hm.addAction(a)
@@ -482,11 +572,15 @@ class MainWindow(QMainWindow):
                 return
             self.ctrl.start_recording()
         else:
-            self.ctrl.stop_recording()
+            sid = self.ctrl.stop_recording()
             self.refresh_learning()
+            QTimer.singleShot(0, lambda: self.review_keybinds(sid))
 
     def on_stop(self):
+        sid = self.ctrl.session["_id"] if self.ctrl.session else None
         self.ctrl.stop_all()
+        if sid:
+            QTimer.singleShot(0, lambda: self.review_keybinds(sid))
         for b in (self.btn_capture, self.btn_record):
             b.blockSignals(True)
             b.setChecked(False)
@@ -539,6 +633,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         sess = sessions[items.index(item)]
+        self.review_keybinds(sess["_id"])          # ask about keys the profile doesn't know
         speed, ok = QInputDialog.getDouble(self, "Replay", "Speed (1.0 = original):", 1.0, 0.25, 3.0, 2)
         if not ok:
             return
@@ -834,7 +929,8 @@ class MainWindow(QMainWindow):
             self.preview.paused_text = ""
         s = cap.stats
         self.lbl_status.setText(
-            f"Capture {'OK' if cap.ok else ('LOST' if cap.running else 'idle')} | "
+            f"Capture {'OK' if cap.ok else ('LOST' if cap.running else 'idle')} [{cap.backend_name}] "
+            f"OpenCL {'on' if gpu_accel.enabled else 'off'} | "
             f"{s['fps']:.1f} fps | frames {s['frames']} | drops {s['drops']} | "
             f"failures {s['failures']} | perception {self.ctrl.perception.avg_ms:.0f} ms | "
             f"policy {'v' + str(self.ctrl.profile.get('model_version')) if self.ctrl.policy else 'none'}")

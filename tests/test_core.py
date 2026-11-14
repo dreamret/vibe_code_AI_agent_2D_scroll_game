@@ -10,7 +10,9 @@ import numpy as np
 import cv2
 
 from app.db import match, clean
-from app.learning import StateEncoder, edit_similarity, compare_examples
+from app.learning import StateEncoder, edit_similarity, compare_examples, remap_vector
+from app import autolabel, gpu
+from app.perception import OnnxYoloDetector
 from app.perception import (TemplateDetector, Tracker, detect_captcha, detect_text_language,
                             extract_scene, infer_class, normalize_text)
 from app.profiles import validate, PROFILE_TEMPLATE
@@ -108,6 +110,64 @@ class TestMultilingual(unittest.TestCase):
     def test_class_signature_cjk(self):
         prof = {"character": {"class_signatures": {"劍士": ["劍士", "斬擊"]}}}
         self.assertEqual(infer_class(prof, [], ["職業: 劍 士", "技能 斬擊"])["candidate"], "劍士")
+
+
+class TestAutoLabelAndRemap(unittest.TestCase):
+    def test_cluster_moving_sprite(self):
+        rng = np.random.default_rng(2)
+        sprite = rng.integers(40, 255, (32, 32, 3), dtype=np.uint8)
+        frames = []
+        for i in range(6):
+            f = np.full((360, 640, 3), 90, np.uint8)
+            x = 60 + i * 50
+            f[200:232, x:x + 32] = sprite
+            frames.append(f)
+        clusters = autolabel.scan_frames(frames)
+        self.assertTrue(clusters and clusters[0]["count"] >= 5)
+        self.assertEqual(clusters[0]["hint"], "moving_entity")
+
+    def test_known_template_is_suggested(self):
+        rng = np.random.default_rng(4)
+        sprite = rng.integers(40, 255, (32, 32, 3), dtype=np.uint8)
+        lib = [("slime", "s1", autolabel.feature(sprite))]
+        label, conf, known = autolabel.suggest_label(autolabel.feature(sprite), "ui", lib)
+        self.assertEqual((label, known), ("slime", True))
+
+    def test_remap_vector_keeps_old_blocks(self):
+        old = ["player", "enemy"]
+        enc = StateEncoder(old)
+        sc = {"counts": {"player": 1, "enemy": 2}, "mean_pos": {"enemy": [.4, .5]},
+              "player": {"cx": .3, "cy": .5}}
+        v = enc.encode(sc)
+        new = remap_vector(v, old, ["player", "item", "enemy"])
+        self.assertEqual(len(new), StateEncoder(["player", "item", "enemy"]).dim)
+        self.assertEqual(new[6:9], v[3:6])          # enemy block moved
+        self.assertEqual(new[3:6], [0.0, 0.0, 0.0])  # new label zero-filled
+
+
+class TestGpuPaths(unittest.TestCase):
+    def test_umat_template_matching_equals_cpu(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "p" / "enemy").mkdir(parents=True)
+        frame = np.random.default_rng(3).integers(0, 255, (360, 640, 3), dtype=np.uint8)
+        cv2.imwrite(str(root / "p" / "enemy" / "s.png"), frame[50:90, 300:340])
+        old = gpu.accel.enabled
+        try:
+            gpu.accel.enabled = False
+            cpu = TemplateDetector(root, "p", 0.8, 0.5, Quiet()).detect(frame)
+            gpu.accel.enabled = True                 # UMat path (runs on CPU if no OpenCL device)
+            g = TemplateDetector(root, "p", 0.8, 0.5, Quiet()).detect(frame)
+        finally:
+            gpu.accel.enabled = old
+        self.assertEqual([e.bbox for e in cpu], [e.bbox for e in g])
+
+    def test_onnx_yolo_decode_letterbox(self):
+        out = np.zeros((1, 6, 100), np.float32)       # 4 box values + 2 classes, 100 anchors
+        out[0, :4, 0] = [320, 320, 64, 64]
+        out[0, 4, 0] = 0.9
+        ents = OnnxYoloDetector.decode(out, .4, .45, 0.5, 0, 140, {0: "slime"}, (1280, 720))
+        self.assertEqual(len(ents), 1)
+        self.assertEqual((ents[0].label, ents[0].bbox), ("slime", (576, 296, 128, 128)))
 
 
 class TestLearning(unittest.TestCase):

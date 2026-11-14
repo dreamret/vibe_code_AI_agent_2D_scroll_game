@@ -1,4 +1,8 @@
 # Optional extras - start.bat tries each one; failures are ignored.
+# GPU screen capture (DXGI Desktop Duplication - works on AMD GPUs)
+dxcam
+# YOLO on the GPU through DirectML (AMD/Intel/NVIDIA). Use .onnx models.
+onnxruntime-directml
 # Gamepad recording (and virtual-pad replay needs vgamepad + ViGEmBus driver)
 pygame
 vgamepad

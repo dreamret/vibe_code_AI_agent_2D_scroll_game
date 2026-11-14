@@ -33,6 +33,38 @@ Recognised text is used for CAPTCHA keywords (EN/zh-TW/ja-JP built in, more via 
 text-language indicator in the Scene tab. Note: Traditional vs Simplified Chinese is reported as `zh`.
 The window/menu text of the app itself is still English.
 
+## Auto-label, elements, keybinds, media
+* **Auto-label tab** – *Scan live capture*: finds recurring unlabelled elements (edges + motion), groups look-alikes
+  and suggests a label (nearest known template, otherwise a hint such as `ui` / `moving_entity`). Tick the groups, fix the
+  label (type a new name to create a new element) and **Apply** → template images + element entries are saved.
+  Nothing is stored until you apply. Accuracy depends on the game: it is assisted labelling, not magic.
+* **Elements tab** – your element catalogue (label, display name, category, on/off, notes, template images).
+  Elements are added to the profile's detector labels automatically; old training examples are re-mapped, so they stay usable.
+* **Database tab** – browse every collection (search, edit as JSON, add, delete, export). Direct edits bypass validation.
+* **Keybind comparison** – after each recording (and before a replay, or via *Profile → Compare keybinds with a demo…*)
+  the agent compares the keys/buttons used in the demo with the profile's keybinds. For every unmapped key it asks
+  for the **purpose** (with a hint from what happened on screen after the key) and lets you *add to profile*,
+  *ignore (never replay)* or *ask later*. It also lists mapped keys that the demo never used.
+* **Media tab** – open a GIF, short video (first 30 s, up to 48 sampled frames) or image: known elements are detected
+  and tracked, text is read (EN / zh-TW / ja-JP), CAPTCHA-like content is flagged, class is inferred, motion and scene
+  changes are measured, and unknown recurring elements get label suggestions (same review/apply flow). Scrub/play the
+  result, export an annotated GIF/MP4 or a JSON report; the analysis is stored in the `media` collection.
+  Templates created from media only match a game window of the same pixel size.
+
+## GPU (AMD) – what runs where
+No CUDA needed. Settings → *GPU check…* (or Help menu) tells you what is active on your PC.
+| Work | GPU path | Setup |
+|---|---|---|
+| Screen capture | DXGI Desktop Duplication via **dxcam** (`capture_backend` = auto/dxcam) | installed by start.bat (optional extras) |
+| Image processing (template matching, resize, gray) | OpenCV **OpenCL** (`cv2.UMat`) | latest AMD Adrenalin driver |
+| YOLO detection | **ONNX Runtime + DirectML** – set the profile's `detector.yolo_model` to an `.onnx` file | `onnxruntime-directml`; export with `yolo export model=best.pt format=onnx` |
+| Video recording | AMD hardware encoder **h264_amf** through ffmpeg (`record_encoder` = auto/amf) | ffmpeg build with AMF on PATH (e.g. gyan.dev "full") |
+
+Every GPU path falls back to the CPU automatically (and logs why). Honest limits: frames still have to be copied to
+system memory for Python/OpenCV, OCR (Tesseract), the kNN policy and the Python loop stay on the CPU, and DXGI
+capture needs the game visible (borderless window; exclusive fullscreen shows black). On a laptop with an AMD iGPU +
+dGPU, set *GPU adapter index* if the wrong adapter is used.
+
 ## Safety behaviour (from the proposal)
 * No input is sent unless the human switch is ON, the game window is focused, the control is allowed
   by the profile and the rate limit is respected.
@@ -55,6 +87,9 @@ isn't reachable the app falls back to TinyDB and logs a warning. Indexes are cre
 | actions | recorded human inputs and executed replay/assist inputs (+ `execution_result`) |
 | training_examples | state features → action → outcome, context, review status (pending/approved/rejected) |
 | models | policy versions, training metadata, evaluation metrics, file path, status |
+| elements | your element catalogue (label, category, notes, enabled) |
+| keybinds | answers to "what is this key for?" (purpose, action name, mapped/ignored) |
+| media | analyses of GIFs / videos / images (summary, per-frame detections, suggestions) |
 | logs | timestamped structured events (level, component, event id, message, context) |
 
 Videos / JPEGs / model files stay on disk (`data/recordings`, `data/models`); the DB stores paths and hashes.
@@ -67,7 +102,8 @@ app/controller.py  glue / app logic         app/db.py   TinyDB+MongoDB layer
 app/capture.py     capture + recording      app/perception.py  detection/OCR/CAPTCHA/class
 app/input_recorder.py  keyboard/mouse/gamepad   app/action_router.py  adapters + safety
 app/learning.py    kNN policy, training, evaluation   app/profiles.py  profile manager
-app/logbus.py      logging bus              app/gui/   PySide6 UI
+app/logbus.py      logging bus              app/gui/   PySide6 UI (main_window, panels, widgets)
+app/autolabel.py   region proposal + clustering   app/media.py  GIF/video/image analysis
 tests/test_core.py offline tests (python -m unittest discover tests -v)
 ```
 

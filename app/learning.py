@@ -44,6 +44,17 @@ class StateEncoder:
         return v
 
 
+def remap_vector(vec: list, old: list[str], new: list[str]) -> list:
+    """Re-order a state vector encoded with label list `old` for label list `new`
+    (new labels get zeros) so examples stay usable when elements are added."""
+    n = FEATURES_PER_LABEL
+    idx = {l: i for i, l in enumerate(old)}
+    out: list = []
+    for l in new:
+        out += list(vec[idx[l] * n:(idx[l] + 1) * n]) if l in idx else [0.0] * n
+    return out + list(vec[len(old) * n:])
+
+
 def edit_similarity(a: list[str], b: list[str]) -> float:
     """1 - normalised Levenshtein distance between two action sequences."""
     if not a and not b:
@@ -170,9 +181,21 @@ def _usable(ex: dict) -> bool:
 def train_candidate(db, settings, log, profile: dict, k: int = 5) -> dict:
     """Train a candidate model on APPROVED examples; evaluate on held-out sessions."""
     labels = profile["detector"]["labels"]
-    dim = StateEncoder(labels).dim
-    exs = [e for e in db.find("training_examples", {"profile_id": profile["_id"]})
-           if _usable(e) and len(e["state_features"]) == dim]
+    exs = []
+    for e in db.find("training_examples", {"profile_id": profile["_id"]}):
+        if not _usable(e):
+            continue
+        vec = e["state_features"]
+        old = e.get("feature_labels")
+        if not old:                                   # older example: labels were a prefix
+            k = (len(vec) - EXTRA_FEATURES) // FEATURES_PER_LABEL
+            old = labels[:k]
+        if len(vec) != StateEncoder(old).dim or any(l not in labels for l in old):
+            continue
+        if old != labels:
+            e = dict(e)
+            e["state_features"] = remap_vector(vec, old, labels)
+        exs.append(e)
     if len(exs) < 10:
         raise ValueError(f"Need at least 10 approved examples (have {len(exs)}). "
                          "Record gameplay with 'Learn' on, then review/approve examples.")
